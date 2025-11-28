@@ -90,13 +90,13 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for GCR
-        run: gcloud auth configure-docker
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
 
       - name: Build and push Docker image
         run: |
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
-          IMAGE_LATEST="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:latest"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
+          IMAGE_LATEST="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:latest"
           
           docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
           docker push $IMAGE_TAG
@@ -106,7 +106,7 @@ jobs:
         id: deploy
         run: |
           REVISION_SUFFIX="prod-$(date +%Y%m%d-%H%M%S)"
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
           STRATEGY="${{ github.event.inputs.deployment_strategy || 'canary' }}"
           
           if [ "$STRATEGY" = "direct" ]; then

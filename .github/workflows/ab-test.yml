@@ -53,12 +53,12 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for GCR
-        run: gcloud auth configure-docker
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
 
       - name: Build and push Docker image
         run: |
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
           docker build -t $IMAGE_TAG .
           docker push $IMAGE_TAG
 
@@ -66,7 +66,7 @@ jobs:
         id: deploy
         run: |
           REVISION_SUFFIX="model-a-$(date +%Y%m%d-%H%M%S)"
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
           
           echo "🅰️  Deploying Model A: ${{ github.event.inputs.model_a_name }}"
           
@@ -112,12 +112,12 @@ jobs:
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@v2
 
-      - name: Configure Docker for GCR
-        run: gcloud auth configure-docker
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
 
       - name: Build and push Docker image
         run: |
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
           docker build -t $IMAGE_TAG .
           docker push $IMAGE_TAG
 
@@ -125,7 +125,7 @@ jobs:
         id: deploy
         run: |
           REVISION_SUFFIX="model-b-$(date +%Y%m%d-%H%M%S)"
-          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
           
           echo "🅱️  Deploying Model B: ${{ github.event.inputs.model_b_name }}"
           
