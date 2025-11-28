@@ -3,9 +3,9 @@ name: 'CI - Staging Deployment'
 on:
   pull_request:
     branches:
-      - 'release/**'
+      - main
     types: [opened, synchronize, reopened]
-    # Triggers when PR is created from develop to release/**
+    # Triggers when PR from release/** to main is created
 
 env:
   PYTHON_VERSION: '3.13'
