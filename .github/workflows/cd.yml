@@ -121,9 +121,9 @@ jobs:
               --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_PROD }},ENVIRONMENT=production" \
               --allow-unauthenticated \
               --min-instances=1 \
-              --max-instances=100 \
-              --memory=2Gi \
-              --cpu=2 \
+              --max-instances=10 \
+              --memory=1Gi \
+              --cpu=1 \
               --timeout=300 \
               --concurrency=80
             
@@ -142,9 +142,9 @@ jobs:
               --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_PROD }},ENVIRONMENT=production" \
               --allow-unauthenticated \
               --min-instances=1 \
-              --max-instances=100 \
-              --memory=2Gi \
-              --cpu=2 \
+              --max-instances=10 \
+              --memory=1Gi \
+              --cpu=1 \
               --timeout=300 \
               --concurrency=80
             
