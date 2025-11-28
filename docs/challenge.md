@@ -84,4 +84,74 @@ We sacrifice XGBoost's potential for capturing non-linear patterns, but:
 - **Maintainability:** Small, readable methods with clear docstrings; avoids inline comments noise; consistent naming and types.
 - **Performance awareness:** Logistic Regression chosen for fast inference in production and simple scaling.
 
+# Part 2
+
+## Model Registry & API Deployment
+
+### Vertex AI Model Registry Integration
+
+The trained model is stored and versioned in **Google Cloud Vertex AI Model Registry** instead of being committed to the repository. This provides several critical advantages for production ML systems.
+
+#### Implementation
+- **Training Script:** `scripts/train_model.py` trains the model locally from the dataset
+- **Upload Script:** `scripts/upload_to_vertex.py` uploads the model to GCS and registers it in Vertex AI
+- **API Loading:** `challenge/api.py` loads the latest model version from Vertex AI Model Registry on startup
+
+#### Model Registry Benefits
+1. **Version Control:** Automatic versioning with timestamps and metadata (framework, model type, task, domain)
+2. **Lineage Tracking:** Track model artifacts, training runs, and deployment history
+3. **Centralized Storage:** Single source of truth for all model versions across teams
+4. **Access Control:** IAM-based permissions for model access and deployment
+5. **Audit Trail:** Complete history of model versions, who uploaded them, and when
+6. **Easy Rollback:** Quickly revert to previous model versions if issues arise
+7. **Metadata & Labels:** Tag models with performance metrics, experiment details, and business context
+
+### Why Model Binaries Should NOT Be in Git Repositories
+
+#### Technical Issues
+- **Repository Bloat:** Binary files (`.pkl`, `.joblib`) are large and Git stores full history
+  - A 10MB model × 50 versions = 500MB of repository bloat
+  - Slows down `git clone`, `git pull`, and all Git operations
+- **Merge Conflicts:** Binary files cannot be merged automatically
+  - Conflicts are unresolvable without manual intervention
+  - Breaks collaborative workflows
+- **Git LFS Limitations:** While Git LFS helps, it adds complexity and has storage/bandwidth costs
+- **No Diff Capability:** Cannot see meaningful differences between model versions
+  - `git diff` shows binary gibberish instead of actual changes
+
+#### Operational Problems
+- **No Versioning Metadata:** Git commits don't capture training metrics, hyperparameters, or data versions
+- **Deployment Friction:** Must redeploy entire application to update model
+- **Environment Coupling:** Model tied to code version, preventing independent model updates
+- **Testing Challenges:** Cannot easily A/B test different model versions in production
+
+### Recommended Approach: External Model Registry
+✅ **Use:** Vertex AI Model Registry, MLflow, Azure ML Model Registry, or S3 + DynamoDB
+✅ **Store:** Model binaries in object storage (GCS, S3) with versioning enabled
+✅ **Track:** Metadata, metrics, and lineage in a dedicated model registry
+✅ **Deploy:** API loads model from registry on startup using environment variables
+✅ **Separate:** Model lifecycle from code lifecycle for independent updates
+
+### API Startup Configuration
+
+The FastAPI application loads the model from Vertex AI using environment variables:
+
+```bash
+export GCP_PROJECT_ID=your-project-id
+export GCP_LOCATION=us-central1
+export VERTEX_MODEL_NAME=flight-delay-model
+```
+
+On startup, the API:
+1. Queries Vertex AI Model Registry for the latest version
+2. Downloads `model.pkl` from GCS to temporary storage
+3. Loads it into memory for inference
+4. Falls back to default predictions if loading fails
+
+This approach enables:
+- **Zero-downtime model updates:** Restart API to load new model version
+- **Environment-specific models:** Dev/staging/prod can use different model versions
+- **Security:** No hardcoded credentials or model paths in code
+- **Scalability:** Multiple API instances load the same model from central registry
+
 
