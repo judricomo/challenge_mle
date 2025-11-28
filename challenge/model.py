@@ -163,7 +163,7 @@ class DelayModel:
         """
         if self._model is None:
             # Return default predictions (no delay) if model not trained
-            return [0] * len(features)
+            return "Model is not trained. Please train the model before prediction."
         
         # Make predictions
         predictions = self._model.predict(features)
