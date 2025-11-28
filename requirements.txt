@@ -7,3 +7,5 @@ pandas>=2.2,<3.0
 scikit-learn>=1.4,<1.6
 google-cloud-storage~=2.14.0
 google-cloud-aiplatform~=1.65.0
+Flask>=2.2,<2.3
+Jinja2>=3.0,<3.1
