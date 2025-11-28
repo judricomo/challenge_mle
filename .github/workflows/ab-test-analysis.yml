@@ -1,0 +1,175 @@
+name: 'A/B Test Analysis'
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours_to_analyze:
+        description: 'Hours of data to analyze'
+        required: true
+        default: '24'
+        type: choice
+        options:
+          - '1'
+          - '6'
+          - '12'
+          - '24'
+          - '48'
+
+env:
+  GCP_PROJECT_ID: 'norse-botany-479603-v0'
+  GCP_REGION: 'us-central1'
+  SERVICE_NAME: 'flight-delay-api'
+
+jobs:
+  analyze:
+    name: Analyze A/B Test Results
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get current traffic split
+        id: traffic
+        run: |
+          echo "## 📊 A/B Test Analysis Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Analysis Period**: Last ${{ github.event.inputs.hours_to_analyze }} hours" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Current Traffic Split" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.GCP_REGION }} \
+            --format='table(status.traffic.revisionName,status.traffic.percent,status.traffic.tag)' \
+            >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Extract revision names for later use
+          REVISIONS=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.GCP_REGION }} \
+            --format='value(status.traffic.revisionName)' | tr '\n' ' ')
+          
+          echo "revisions=$REVISIONS" >> $GITHUB_OUTPUT
+
+      - name: Analyze request counts
+        run: |
+          HOURS=${{ github.event.inputs.hours_to_analyze }}
+          TIMESTAMP=$(date -u -d "$HOURS hours ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-${HOURS}H +"%Y-%m-%dT%H:%M:%SZ")
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Request Count by Revision" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Query logs for request counts
+          echo "Analyzing logs from: $TIMESTAMP"
+          
+          gcloud logging read \
+            "resource.type=cloud_run_revision 
+             AND resource.labels.service_name=${{ env.SERVICE_NAME }}
+             AND timestamp>=\"$TIMESTAMP\"
+             AND httpRequest.requestUrl=~\"/predict\"" \
+            --limit=10000 \
+            --format=json \
+            > /tmp/logs.json
+          
+          # Count requests per revision
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Requests per revision:" >> $GITHUB_STEP_SUMMARY
+          cat /tmp/logs.json | jq -r '.[] | .resource.labels.revision_name' | sort | uniq -c | sort -rn >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Analyze error rates
+        run: |
+          HOURS=${{ github.event.inputs.hours_to_analyze }}
+          TIMESTAMP=$(date -u -d "$HOURS hours ago" +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -v-${HOURS}H +"%Y-%m-%dT%H:%M:%SZ")
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Error Rates" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Query for errors
+          gcloud logging read \
+            "resource.type=cloud_run_revision 
+             AND resource.labels.service_name=${{ env.SERVICE_NAME }}
+             AND timestamp>=\"$TIMESTAMP\"
+             AND (severity>=ERROR OR httpRequest.status>=400)" \
+            --limit=1000 \
+            --format=json \
+            > /tmp/errors.json
+          
+          # Count errors per revision
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Errors per revision:" >> $GITHUB_STEP_SUMMARY
+          if [ -s /tmp/errors.json ]; then
+            cat /tmp/errors.json | jq -r '.[] | .resource.labels.revision_name' | sort | uniq -c | sort -rn >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No errors found ✅" >> $GITHUB_STEP_SUMMARY
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Get latency metrics
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Latency Metrics" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "View detailed latency metrics in [Cloud Monitoring](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}/metrics?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "To get detailed latency statistics, run:" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo 'gcloud monitoring time-series list \' >> $GITHUB_STEP_SUMMARY
+          echo '  --filter='"'"'metric.type="run.googleapis.com/request_latencies"'"'" \' >> $GITHUB_STEP_SUMMARY
+          echo '  --format="table(metric.labels.revision_name,value)"' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Provide recommendations
+        run: |
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Recommendations" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Based on the analysis above, consider the following:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Compare the metrics**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Which model has lower error rate?" >> $GITHUB_STEP_SUMMARY
+          echo "   - Which model has better latency?" >> $GITHUB_STEP_SUMMARY
+          echo "   - Which model serves more requests successfully?" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Check business metrics**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - Prediction accuracy (if you have ground truth data)" >> $GITHUB_STEP_SUMMARY
+          echo "   - User feedback or downstream system performance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Decision matrix**:" >> $GITHUB_STEP_SUMMARY
+          echo "   - **If Model A is better**: Route 100% traffic to Model A" >> $GITHUB_STEP_SUMMARY
+          echo "   - **If Model B is better**: Route 100% traffic to Model B" >> $GITHUB_STEP_SUMMARY
+          echo "   - **If results are inconclusive**: Continue A/B test for longer period" >> $GITHUB_STEP_SUMMARY
+          echo "   - **If both models are similar**: Choose based on other factors (cost, maintainability)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔄 Next Actions" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**To promote a winner, get the revision names from the traffic split above, then:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Promote chosen revision to 100%" >> $GITHUB_STEP_SUMMARY
+          echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --to-revisions=<winning-revision-name>=100 \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**To adjust the traffic split for more data:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Run the **A/B Test Deployment** workflow again with a different traffic split percentage." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Useful Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Cloud Run Console](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Metrics Dashboard](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}/metrics?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Logs Explorer](https://console.cloud.google.com/logs/query?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [SLO Monitoring](https://console.cloud.google.com/monitoring/services?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
