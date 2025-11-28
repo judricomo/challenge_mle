@@ -23,10 +23,9 @@ install:		## Install dependencies
 	pip install -r requirements-test.txt
 	pip install -r requirements.txt
 
-STRESS_URL = http://127.0.0.1:8000 
+STRESS_URL ?= http://127.0.0.1:8000
 .PHONY: stress-test
-stress-test:
-	# change stress url to your deployed app 
+stress-test:		## Run stress tests (use STRESS_URL=<url> to override)
 	mkdir reports || true
 	locust -f tests/stress/api_stress.py --print-stats --html reports/stress-test.html --run-time 60s --headless --users 100 --spawn-rate 1 -H $(STRESS_URL)
 
@@ -43,3 +42,20 @@ api-test:			## Run tests and coverage
 .PHONY: build
 build:			## Build locally the python artifact
 	python setup.py bdist_wheel
+
+# ============================================
+# Docker Commands
+# ============================================
+
+.PHONY: docker-build
+docker-build:		## Build Docker image locally
+	docker build -t flight-delay-api:local .
+
+.PHONY: docker-run
+docker-run:		## Run Docker container locally
+	docker run -p 8080:8080 \
+		-e GCP_PROJECT_ID=$(GCP_PROJECT_ID) \
+		-e GCP_LOCATION=$(GCP_LOCATION) \
+		-e VERTEX_MODEL_NAME=$(VERTEX_MODEL_NAME) \
+		-e ENVIRONMENT=local \
+		flight-delay-api:local

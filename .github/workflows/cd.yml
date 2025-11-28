@@ -1,7 +1,323 @@
-name: 'Continuous Delivery'
+name: 'CD - Production Deployment'
 
 on:
-  ...
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deployment_strategy:
+        description: 'Deployment strategy'
+        required: true
+        default: 'canary'
+        type: choice
+        options:
+          - canary
+          - direct
+      canary_percent:
+        description: 'Initial canary percentage (only for canary strategy)'
+        required: false
+        default: '10'
+        type: choice
+        options:
+          - '10'
+          - '25'
+          - '50'
+
+env:
+  PYTHON_VERSION: '3.13'
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
 
 jobs:
-  ...
+  test:
+    name: Run All Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+
+      - name: Run all tests
+        run: |
+          mkdir -p reports
+          pytest --cov-config=.coveragerc \
+                 --cov-report term \
+                 --cov-report xml:reports/coverage.xml \
+                 --junitxml=reports/junit.xml \
+                 --cov=challenge \
+                 tests/
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: test
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      service_url: ${{ steps.get_url.outputs.service_url }}
+      new_revision: ${{ steps.deploy.outputs.new_revision }}
+      deployment_type: ${{ steps.deploy.outputs.deployment_type }}
+      canary_percent: ${{ steps.deploy.outputs.canary_percent }}
+      current_revision: ${{ steps.deploy.outputs.current_revision }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.GCP_REGION }}-docker.pkg.dev
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
+          IMAGE_LATEST="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:latest"
+          
+          docker build -t $IMAGE_TAG -t $IMAGE_LATEST .
+          docker push $IMAGE_TAG
+          docker push $IMAGE_LATEST
+
+      - name: Deploy to Cloud Run (production)
+        id: deploy
+        run: |
+          REVISION_SUFFIX="prod-$(date +%Y%m%d-%H%M%S)"
+          IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:prod-${{ github.sha }}"
+          STRATEGY="${{ github.event.inputs.deployment_strategy || 'canary' }}"
+          
+          if [ "$STRATEGY" = "direct" ]; then
+            echo "📦 Deploying with 100% traffic (direct strategy)..."
+            
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=$IMAGE_TAG \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --revision-suffix=$REVISION_SUFFIX \
+              --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_PROD }},ENVIRONMENT=production" \
+              --allow-unauthenticated \
+              --min-instances=1 \
+              --max-instances=100 \
+              --memory=2Gi \
+              --cpu=2 \
+              --timeout=300 \
+              --concurrency=80
+            
+            echo "deployment_type=direct" >> $GITHUB_OUTPUT
+          else
+            echo "🐤 Deploying with canary strategy..."
+            
+            # Deploy with no traffic first
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=$IMAGE_TAG \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --revision-suffix=$REVISION_SUFFIX \
+              --no-traffic \
+              --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_PROD }},ENVIRONMENT=production" \
+              --allow-unauthenticated \
+              --min-instances=1 \
+              --max-instances=100 \
+              --memory=2Gi \
+              --cpu=2 \
+              --timeout=300 \
+              --concurrency=80
+            
+            # Get current production revision
+            CURRENT_REVISION=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --format='value(status.traffic[0].revisionName)')
+            
+            # Split traffic
+            CANARY_PERCENT="${{ github.event.inputs.canary_percent || '10' }}"
+            REMAINING_PERCENT=$((100 - CANARY_PERCENT))
+            
+            echo "📊 Splitting traffic: $CANARY_PERCENT% to new revision, $REMAINING_PERCENT% to current"
+            
+            gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --to-revisions=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX=$CANARY_PERCENT,$CURRENT_REVISION=$REMAINING_PERCENT
+            
+            echo "deployment_type=canary" >> $GITHUB_OUTPUT
+            echo "canary_percent=$CANARY_PERCENT" >> $GITHUB_OUTPUT
+            echo "current_revision=$CURRENT_REVISION" >> $GITHUB_OUTPUT
+          fi
+          
+          echo "new_revision=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX" >> $GITHUB_OUTPUT
+
+      - name: Get service URL
+        id: get_url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='value(status.url)')
+          
+          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
+
+      - name: Verify deployment
+        run: |
+          echo "🧪 Verifying deployment..."
+          SERVICE_URL="${{ steps.get_url.outputs.service_url }}"
+          
+          # Health check
+          curl -f "$SERVICE_URL/health" || exit 1
+          
+          # Test prediction endpoint
+          curl -f -X POST "$SERVICE_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{"flights":[{"OPERA":"Aerolineas Argentinas","TIPOVUELO":"N","MES":3}]}' || exit 1
+          
+          echo "✅ Deployment verification passed!"
+
+  stress-test-production:
+    name: Run Production Stress Tests
+    runs-on: ubuntu-latest
+    needs: deploy-production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install stress test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-test.txt
+
+      - name: Run stress tests on production
+        run: |
+          mkdir -p reports
+          STRESS_URL="${{ needs.deploy-production.outputs.service_url }}"
+          
+          echo "🔥 Running stress tests against: $STRESS_URL"
+          
+          locust -f tests/stress/api_stress.py \
+            --print-stats \
+            --html reports/stress-test-prod.html \
+            --run-time 60s \
+            --headless \
+            --users 100 \
+            --spawn-rate 1 \
+            -H $STRESS_URL
+
+      - name: Upload stress test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-test-production-report
+          path: reports/stress-test-prod.html
+
+      - name: Create deployment summary
+        run: |
+          DEPLOYMENT_TYPE="${{ needs.deploy-production.outputs.deployment_type }}"
+          NEW_REVISION="${{ needs.deploy-production.outputs.new_revision }}"
+          SERVICE_URL="${{ needs.deploy-production.outputs.service_url }}"
+          
+          echo "## 🚀 Production Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Strategy**: $DEPLOYMENT_TYPE" >> $GITHUB_STEP_SUMMARY
+          echo "**New Revision**: \`$NEW_REVISION\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Service URL**: $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment**: Production" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Stress Test Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Duration**: 60 seconds" >> $GITHUB_STEP_SUMMARY
+          echo "- **Concurrent Users**: 100 users" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: Passed" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$DEPLOYMENT_TYPE" = "canary" ]; then
+            CANARY_PERCENT="${{ needs.deploy-production.outputs.canary_percent }}"
+            CURRENT_REVISION="${{ needs.deploy-production.outputs.current_revision }}"
+            REMAINING=$((100 - CANARY_PERCENT))
+            
+            echo "### 📊 Traffic Split" >> $GITHUB_STEP_SUMMARY
+            echo "- **New revision** (\`$NEW_REVISION\`): **${CANARY_PERCENT}%**" >> $GITHUB_STEP_SUMMARY
+            echo "- **Previous revision** (\`$CURRENT_REVISION\`): **${REMAINING}%**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### 📈 Next Steps for Canary Deployment" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**1. Monitor metrics for 15-30 minutes:**" >> $GITHUB_STEP_SUMMARY
+            echo "- Error rates in [Cloud Logging](https://console.cloud.google.com/logs?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+            echo "- Latency in [Cloud Monitoring](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}/metrics?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+            echo "- Request success rate" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**2. Check current traffic split:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "gcloud run services describe ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --region=${{ env.GCP_REGION }} \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --format='table(status.traffic.revisionName,status.traffic.percent)'" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**3. Increase traffic if metrics look good:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "# Increase to 50%" >> $GITHUB_STEP_SUMMARY
+            echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --to-revisions=$NEW_REVISION=50,$CURRENT_REVISION=50 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "# Or use workflow: Actions → CD - Production → Run workflow → 50%" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**4. Promote to 100% when confident:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --to-revisions=$NEW_REVISION=100 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**5. Rollback if issues detected:**" >> $GITHUB_STEP_SUMMARY
+            echo '```bash' >> $GITHUB_STEP_SUMMARY
+            echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --to-revisions=$CURRENT_REVISION=100 \\" >> $GITHUB_STEP_SUMMARY
+            echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### 📊 Traffic Distribution" >> $GITHUB_STEP_SUMMARY
+            echo "**100%** to new revision" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ Direct deployment completed successfully!" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Service URL]($SERVICE_URL)" >> $GITHUB_STEP_SUMMARY
+          echo "- [API Documentation]($SERVICE_URL/docs)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Cloud Run Console](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Metrics Dashboard](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}/metrics?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Logs](https://console.cloud.google.com/logs/query?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
