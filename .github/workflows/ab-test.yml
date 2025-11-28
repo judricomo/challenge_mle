@@ -1,0 +1,302 @@
+name: 'A/B Test Deployment'
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_a_name:
+        description: 'Model A name in Vertex AI (baseline)'
+        required: true
+        default: 'flight-delay-model'
+      model_b_name:
+        description: 'Model B name in Vertex AI (variant)'
+        required: true
+        default: 'flight-delay-model-v2'
+      traffic_split:
+        description: 'Traffic percentage for Model B (Model A gets the rest)'
+        required: true
+        default: '50'
+        type: choice
+        options:
+          - '10'
+          - '25'
+          - '50'
+          - '75'
+          - '90'
+
+env:
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+
+jobs:
+  deploy-model-a:
+    name: Deploy Model A (Baseline)
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      revision_a: ${{ steps.deploy.outputs.revision_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+
+      - name: Deploy Model A revision
+        id: deploy
+        run: |
+          REVISION_SUFFIX="model-a-$(date +%Y%m%d-%H%M%S)"
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-a-${{ github.sha }}"
+          
+          echo "🅰️  Deploying Model A: ${{ github.event.inputs.model_a_name }}"
+          
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=$IMAGE_TAG \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --revision-suffix=$REVISION_SUFFIX \
+            --no-traffic \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ github.event.inputs.model_a_name }},MODEL_VERSION=A" \
+            --allow-unauthenticated \
+            --min-instances=1 \
+            --max-instances=100 \
+            --memory=2Gi \
+            --cpu=2 \
+            --tag=model-a
+          
+          echo "revision_name=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX" >> $GITHUB_OUTPUT
+          echo "✅ Model A deployed: $REVISION_SUFFIX"
+
+  deploy-model-b:
+    name: Deploy Model B (Variant)
+    runs-on: ubuntu-latest
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      revision_b: ${{ steps.deploy.outputs.revision_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+
+      - name: Deploy Model B revision
+        id: deploy
+        run: |
+          REVISION_SUFFIX="model-b-$(date +%Y%m%d-%H%M%S)"
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:ab-model-b-${{ github.sha }}"
+          
+          echo "🅱️  Deploying Model B: ${{ github.event.inputs.model_b_name }}"
+          
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=$IMAGE_TAG \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --revision-suffix=$REVISION_SUFFIX \
+            --no-traffic \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ github.event.inputs.model_b_name }},MODEL_VERSION=B" \
+            --allow-unauthenticated \
+            --min-instances=1 \
+            --max-instances=100 \
+            --memory=2Gi \
+            --cpu=2 \
+            --tag=model-b
+          
+          echo "revision_name=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX" >> $GITHUB_OUTPUT
+          echo "✅ Model B deployed: $REVISION_SUFFIX"
+
+  split-traffic:
+    name: Configure Traffic Split
+    runs-on: ubuntu-latest
+    needs: [deploy-model-a, deploy-model-b]
+    
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Split traffic between models
+        run: |
+          REVISION_A="${{ needs.deploy-model-a.outputs.revision_a }}"
+          REVISION_B="${{ needs.deploy-model-b.outputs.revision_b }}"
+          PERCENT_B="${{ github.event.inputs.traffic_split }}"
+          PERCENT_A=$((100 - PERCENT_B))
+          
+          echo "🔀 Splitting traffic:"
+          echo "  Model A ($REVISION_A): ${PERCENT_A}%"
+          echo "  Model B ($REVISION_B): ${PERCENT_B}%"
+          
+          gcloud run services update-traffic ${{ env.SERVICE_NAME }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --to-revisions=$REVISION_A=$PERCENT_A,$REVISION_B=$PERCENT_B
+
+      - name: Get service URL
+        id: get_url
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='value(status.url)')
+          
+          echo "service_url=$SERVICE_URL" >> $GITHUB_OUTPUT
+
+      - name: Get tagged URLs
+        id: get_tagged_urls
+        run: |
+          # Get the unique tagged URLs for direct testing
+          MODEL_A_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='value(status.traffic[?tag="model-a"].url)')
+          
+          MODEL_B_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='value(status.traffic[?tag="model-b"].url)')
+          
+          echo "model_a_url=$MODEL_A_URL" >> $GITHUB_OUTPUT
+          echo "model_b_url=$MODEL_B_URL" >> $GITHUB_OUTPUT
+
+      - name: Create A/B test summary
+        run: |
+          REVISION_A="${{ needs.deploy-model-a.outputs.revision_a }}"
+          REVISION_B="${{ needs.deploy-model-b.outputs.revision_b }}"
+          PERCENT_B="${{ github.event.inputs.traffic_split }}"
+          PERCENT_A=$((100 - PERCENT_B))
+          SERVICE_URL="${{ steps.get_url.outputs.service_url }}"
+          MODEL_A_URL="${{ steps.get_tagged_urls.outputs.model_a_url }}"
+          MODEL_B_URL="${{ steps.get_tagged_urls.outputs.model_b_url }}"
+          
+          echo "## 🧪 A/B Test Started" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "| Model | Vertex AI Name | Traffic | Revision |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|----------------|---------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| 🅰️ Model A (Baseline) | \`${{ github.event.inputs.model_a_name }}\` | **${PERCENT_A}%** | \`$REVISION_A\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 🅱️ Model B (Variant) | \`${{ github.event.inputs.model_b_name }}\` | **${PERCENT_B}%** | \`$REVISION_B\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Service URLs" >> $GITHUB_STEP_SUMMARY
+          echo "- **Main Service** (traffic split): $SERVICE_URL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Model A only** (tagged): $MODEL_A_URL" >> $GITHUB_STEP_SUMMARY
+          echo "- **Model B only** (tagged): $MODEL_B_URL" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🧪 Testing" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Model A directly:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "curl -X POST $MODEL_A_URL/predict \\" >> $GITHUB_STEP_SUMMARY
+          echo '  -H "Content-Type: application/json" \' >> $GITHUB_STEP_SUMMARY
+          echo '  -d '"'"'{"flights":[{"OPERA":"Grupo LATAM","TIPOVUELO":"N","MES":3}]}'"'">> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Test Model B directly:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "curl -X POST $MODEL_B_URL/predict \\" >> $GITHUB_STEP_SUMMARY
+          echo '  -H "Content-Type: application/json" \' >> $GITHUB_STEP_SUMMARY
+          echo '  -d '"'"'{"flights":[{"OPERA":"Grupo LATAM","TIPOVUELO":"N","MES":3}]}'"'">> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 Monitoring" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Check current traffic split:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "gcloud run services describe ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --region=${{ env.GCP_REGION }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --format='table(status.traffic.revisionName,status.traffic.percent,status.traffic.tag)'" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**View logs by model:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Model A logs" >> $GITHUB_STEP_SUMMARY
+          echo "gcloud logging read \\" >> $GITHUB_STEP_SUMMARY
+          echo '  "resource.type=cloud_run_revision AND resource.labels.revision_name='"$REVISION_A"'" \' >> $GITHUB_STEP_SUMMARY
+          echo "  --limit 50" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# Model B logs" >> $GITHUB_STEP_SUMMARY
+          echo "gcloud logging read \\" >> $GITHUB_STEP_SUMMARY
+          echo '  "resource.type=cloud_run_revision AND resource.labels.revision_name='"$REVISION_B"'" \' >> $GITHUB_STEP_SUMMARY
+          echo "  --limit 50" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "1. **Monitor** both models for 24-48 hours" >> $GITHUB_STEP_SUMMARY
+          echo "2. **Compare metrics**: error rates, latency, business KPIs" >> $GITHUB_STEP_SUMMARY
+          echo "3. **Run analysis workflow**: Actions → A/B Test Analysis" >> $GITHUB_STEP_SUMMARY
+          echo "4. **Adjust traffic** if needed (re-run this workflow with different split)" >> $GITHUB_STEP_SUMMARY
+          echo "5. **Promote winner** to 100%" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Promote Model A to 100%:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --to-revisions=$REVISION_A=100 \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Promote Model B to 100%:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "gcloud run services update-traffic ${{ env.SERVICE_NAME }} \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --to-revisions=$REVISION_B=100 \\" >> $GITHUB_STEP_SUMMARY
+          echo "  --region=${{ env.GCP_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🔗 Links" >> $GITHUB_STEP_SUMMARY
+          echo "- [Cloud Run Console](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Metrics Dashboard](https://console.cloud.google.com/run/detail/${{ env.GCP_REGION }}/${{ env.SERVICE_NAME }}/metrics?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY
+          echo "- [Logs Explorer](https://console.cloud.google.com/logs/query?project=${{ env.GCP_PROJECT_ID }})" >> $GITHUB_STEP_SUMMARY

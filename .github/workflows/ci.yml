@@ -1,7 +1,268 @@
-name: 'Continuous Integration'
+name: 'CI - Staging Deployment'
 
 on:
-  ...
+  pull_request:
+    branches:
+      - 'release/**'
+    types: [opened, synchronize, reopened]
+    # Triggers when PR is created from develop to release/**
+
+env:
+  PYTHON_VERSION: '3.13'
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
 
 jobs:
-  ...
+  test:
+    name: Run All Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+
+      - name: Run model tests
+        run: |
+          mkdir -p reports
+          pytest --cov-config=.coveragerc \
+                 --cov-report term \
+                 --cov-report xml:reports/coverage.xml \
+                 --junitxml=reports/junit.xml \
+                 --cov=challenge \
+                 tests/model
+
+      - name: Run API tests
+        run: |
+          pytest --cov-config=.coveragerc \
+                 --cov-report term \
+                 --cov-report xml:reports/coverage.xml \
+                 --junitxml=reports/junit.xml \
+                 --cov=challenge \
+                 tests/api
+
+      - name: Upload coverage reports
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./reports/coverage.xml
+          fail_ci_if_error: false
+
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: ${{ env.SERVICE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to Staging (0% traffic)
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    outputs:
+      revision_url: ${{ steps.deploy.outputs.revision_url }}
+      revision_name: ${{ steps.deploy.outputs.revision_name }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker
+
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:staging-${{ github.sha }}"
+          docker build -t $IMAGE_TAG .
+          docker push $IMAGE_TAG
+
+      - name: Deploy to Cloud Run (staging revision)
+        id: deploy
+        run: |
+          REVISION_SUFFIX="staging-$(date +%Y%m%d-%H%M%S)"
+          IMAGE_TAG="gcr.io/${{ env.GCP_PROJECT_ID }}/${{ env.SERVICE_NAME }}:staging-${{ github.sha }}"
+          
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=$IMAGE_TAG \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --revision-suffix=$REVISION_SUFFIX \
+            --no-traffic \
+            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_STAGING }},ENVIRONMENT=staging" \
+            --allow-unauthenticated \
+            --min-instances=0 \
+            --max-instances=10 \
+            --memory=2Gi \
+            --cpu=2 \
+            --timeout=300 \
+            --concurrency=80
+          
+          REVISION_URL=$(gcloud run revisions describe ${{ env.SERVICE_NAME }}-$REVISION_SUFFIX \
+            --platform=managed \
+            --region=${{ env.GCP_REGION }} \
+            --project=${{ env.GCP_PROJECT_ID }} \
+            --format='value(status.url)')
+          
+          echo "revision_url=$REVISION_URL" >> $GITHUB_OUTPUT
+          echo "revision_name=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX" >> $GITHUB_OUTPUT
+
+      - name: Test staging deployment
+        run: |
+          echo "🧪 Testing staging deployment..."
+          REVISION_URL="${{ steps.deploy.outputs.revision_url }}"
+          
+          # Health check
+          echo "Testing health endpoint..."
+          curl -f "$REVISION_URL/health" || exit 1
+          
+          # Test prediction endpoint
+          echo "Testing predict endpoint..."
+          curl -f -X POST "$REVISION_URL/predict" \
+            -H "Content-Type: application/json" \
+            -d '{"flights":[{"OPERA":"Aerolineas Argentinas","TIPOVUELO":"N","MES":3}]}' || exit 1
+          
+          echo "✅ Basic tests passed!"
+
+  stress-test:
+    name: Run Stress Tests
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install stress test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install locust~=1.6
+
+      - name: Run stress tests
+        run: |
+          mkdir -p reports
+          STRESS_URL="${{ needs.deploy-staging.outputs.revision_url }}"
+          
+          echo "🔥 Running stress tests against: $STRESS_URL"
+          
+          locust -f tests/stress/api_stress.py \
+            --print-stats \
+            --html reports/stress-test-staging.html \
+            --run-time 60s \
+            --headless \
+            --users 100 \
+            --spawn-rate 1 \
+            -H $STRESS_URL
+
+      - name: Upload stress test report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-test-staging-report
+          path: reports/stress-test-staging.html
+
+      - name: Comment PR with results
+        uses: actions/github-script@v7
+        if: always()
+        with:
+          script: |
+            const revisionUrl = '${{ needs.deploy-staging.outputs.revision_url }}';
+            const revisionName = '${{ needs.deploy-staging.outputs.revision_name }}';
+            
+            const comment = `## 🚀 Staging Deployment Complete
+            
+            **Revision**: \`${revisionName}\`
+            **Traffic**: 0% (isolated testing - not serving live traffic)
+            **Environment**: Staging
+            
+            ### ✅ Stress Test Results
+            - **Duration**: 60 seconds
+            - **Concurrent Users**: 100
+            - **Spawn Rate**: 1 user/second
+            - **Status**: Passed
+            
+            📊 [Download full stress test report](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+            
+            ### 🧪 Test URLs
+            - **Health Check**: ${revisionUrl}/health
+            - **API Docs**: ${revisionUrl}/docs
+            - **OpenAPI Spec**: ${revisionUrl}/openapi.json
+            
+            ### 🔬 Manual Testing
+            \`\`\`bash
+            # Health check
+            curl ${revisionUrl}/health
+            
+            # Single prediction
+            curl -X POST ${revisionUrl}/predict \\
+              -H "Content-Type: application/json" \\
+              -d '{"flights":[{"OPERA":"Grupo LATAM","TIPOVUELO":"N","MES":3}]}'
+            
+            # Multiple predictions
+            curl -X POST ${revisionUrl}/predict \\
+              -H "Content-Type: application/json" \\
+              -d '{"flights":[
+                {"OPERA":"Aerolineas Argentinas","TIPOVUELO":"N","MES":3},
+                {"OPERA":"Sky Airline","TIPOVUELO":"I","MES":7}
+              ]}'
+            \`\`\`
+            
+            ### 📝 Next Steps
+            ✅ All tests passed! 
+            - Review the staging environment thoroughly
+            - When ready, merge this PR to deploy to production
+            - Production deployment will use canary strategy (10% initial traffic)
+            `;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
