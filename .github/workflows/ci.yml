@@ -123,21 +123,43 @@ jobs:
           REVISION_SUFFIX="staging-$(date +%Y%m%d-%H%M%S)"
           IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:staging-${{ github.sha }}"
           
-          gcloud run deploy ${{ env.SERVICE_NAME }} \
-            --image=$IMAGE_TAG \
-            --platform=managed \
+          # Check if service exists
+          if gcloud run services describe ${{ env.SERVICE_NAME }} \
             --region=${{ env.GCP_REGION }} \
-            --project=${{ env.GCP_PROJECT_ID }} \
-            --revision-suffix=$REVISION_SUFFIX \
-            --no-traffic \
-            --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_STAGING }},ENVIRONMENT=staging" \
-            --allow-unauthenticated \
-            --min-instances=0 \
-            --max-instances=10 \
-            --memory=2Gi \
-            --cpu=2 \
-            --timeout=300 \
-            --concurrency=80
+            --project=${{ env.GCP_PROJECT_ID }} >/dev/null 2>&1; then
+            
+            echo "🔄 Service exists - deploying staging revision without traffic"
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=$IMAGE_TAG \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --revision-suffix=$REVISION_SUFFIX \
+              --no-traffic \
+              --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_STAGING }},ENVIRONMENT=staging" \
+              --min-instances=0 \
+              --max-instances=10 \
+              --memory=2Gi \
+              --cpu=2 \
+              --timeout=300 \
+              --concurrency=80
+          else
+            echo "🆕 Service does not exist - creating new service with traffic"
+            gcloud run deploy ${{ env.SERVICE_NAME }} \
+              --image=$IMAGE_TAG \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --revision-suffix=$REVISION_SUFFIX \
+              --set-env-vars="GCP_PROJECT_ID=${{ env.GCP_PROJECT_ID }},GCP_LOCATION=${{ env.GCP_REGION }},VERTEX_MODEL_NAME=${{ secrets.VERTEX_MODEL_NAME_STAGING }},ENVIRONMENT=staging" \
+              --allow-unauthenticated \
+              --min-instances=0 \
+              --max-instances=10 \
+              --memory=2Gi \
+              --cpu=2 \
+              --timeout=300 \
+              --concurrency=80
+          fi
           
           REVISION_URL=$(gcloud run revisions describe ${{ env.SERVICE_NAME }}-$REVISION_SUFFIX \
             --platform=managed \
