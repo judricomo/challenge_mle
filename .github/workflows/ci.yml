@@ -120,6 +120,8 @@ jobs:
       - name: Deploy to Cloud Run (staging revision)
         id: deploy
         run: |
+          set -euo pipefail
+          
           REVISION_SUFFIX="staging-$(date +%Y%m%d-%H%M%S)"
           IMAGE_TAG="${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/flight-delay-api/${{ env.SERVICE_NAME }}:staging-${{ github.sha }}"
           
@@ -161,12 +163,28 @@ jobs:
               --concurrency=80
           fi
           
+          echo "📍 Retrieving revision URL..."
           REVISION_URL=$(gcloud run revisions describe ${{ env.SERVICE_NAME }}-$REVISION_SUFFIX \
             --platform=managed \
             --region=${{ env.GCP_REGION }} \
             --project=${{ env.GCP_PROJECT_ID }} \
             --format='value(status.url)')
           
+          if [ -z "$REVISION_URL" ]; then
+            echo "❌ Error: Revision URL not found. Check deployment logs."
+            echo "Attempting to get service URL instead..."
+            REVISION_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+              --platform=managed \
+              --region=${{ env.GCP_REGION }} \
+              --project=${{ env.GCP_PROJECT_ID }} \
+              --format='value(status.url)')
+            if [ -z "$REVISION_URL" ]; then
+              echo "❌ Error: Service URL also not found. Deployment may have failed."
+              exit 1
+            fi
+          fi
+          
+          echo "✅ Revision URL: $REVISION_URL"
           echo "revision_url=$REVISION_URL" >> $GITHUB_OUTPUT
           echo "revision_name=${{ env.SERVICE_NAME }}-$REVISION_SUFFIX" >> $GITHUB_OUTPUT
 
