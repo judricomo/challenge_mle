@@ -16,9 +16,9 @@ on:
           - '48'
 
 env:
-  GCP_PROJECT_ID: 'norse-botany-479603-v0'
-  GCP_REGION: 'us-central1'
-  SERVICE_NAME: 'flight-delay-api'
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  GCP_REGION: ${{ vars.GCP_REGION }}
+  SERVICE_NAME: ${{ vars.SERVICE_NAME }}
 
 jobs:
   analyze:
