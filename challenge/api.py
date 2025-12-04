@@ -71,7 +71,7 @@ async def load_model_on_startup() -> None:
         print(f"Found model: {latest_model.resource_name}")
         
         # Extract GCS path from model artifact URI
-        artifact_uri = latest_model.artifact_uri
+        artifact_uri = latest_model.gca_resource.artifact_uri
         print(f"Artifact URI: {artifact_uri}")
         
         # Download model.pkl from GCS
